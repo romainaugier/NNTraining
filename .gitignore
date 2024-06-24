@@ -1,4 +1,5 @@
-# dirs 
+# Dirs 
 env 
-models 
-data 
+
+# Python files
+*.pyc
