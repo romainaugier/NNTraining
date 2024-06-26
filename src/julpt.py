@@ -1,10 +1,10 @@
 import typing
 import sys
-
-from torch.autograd import forward_ad
-import tqdm
+import time
+import optparse
 
 import torch
+from torch._C import _jit_pass_onnx_unpack_quantized_weights
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -145,6 +145,7 @@ class FeedForward(nn.Module):
                 nn.Linear(n_embeddings, 4 * n_embeddings),
                 nn.ReLU(),
                 nn.Linear(4 * n_embeddings, n_embeddings),
+                nn.Dropout(0.2),
             )
 
     def forward(self, x):
@@ -190,6 +191,7 @@ class JulPT(nn.Module):
         x = token_emb + pos_emb
 
         x = self.blocks(x)
+
         x = self.ln_f(x)
 
         logits = self.lm_head(x)
@@ -223,56 +225,74 @@ class JulPT(nn.Module):
         return idx
 
 if __name__ == "__main__":
-    tokens, vocab = load_and_prep_data(f"{common.DATA_DIR}/lyrics_jul.txt")
+    option_parser = optparse.OptionParser()
+
+    option_parser.add_option("--train", dest="train", action="store_true")
+    option_parser.add_option("--generate", dest="generate", action="store_true")
+    option_parser.add_option("--model-path", dest="model_path", type="str", default=None)
+    option_parser.add_option("--num-tokens", dest="num_tokens", type="int", default=1000)
+
+    options, args = option_parser.parse_args()
+
+    tokens, vocab = load_and_prep_data(f"{common.DATA_DIR}/lyrics_jul_2.txt")
     vocab_size = len(vocab)
 
     encoded_tokens, encode_table, decode_table = encode_tokens(tokens, vocab)
-    encoded_tokens = torch.tensor(encoded_tokens)
 
-    context_size = 128
-    batch_size = 64
+    if options.train:
+        encoded_tokens = torch.tensor(encoded_tokens)
 
-    jpt = JulPT(vocab_size, context_size, 128, 6)
-    jpt = jpt.to(DEVICE)
+        context_size = 384
+        batch_size = 64
 
-    training_size = int(len(encoded_tokens) * 0.8)
-    val_size = int(len(encoded_tokens) * 0.1)
+        jpt = JulPT(vocab_size, context_size, 384, 8)
+        jpt = jpt.to(DEVICE)
 
-    training_tokens = encoded_tokens[:training_size]
-    val_tokens = encoded_tokens[training_size:training_size + val_size]
-    test_tokens = encoded_tokens[training_size + val_size:]
+        training_size = int(len(encoded_tokens) * 0.8)
+        val_size = int(len(encoded_tokens) * 0.1)
 
-    print("Training the model")
+        training_tokens = encoded_tokens[:training_size]
+        val_tokens = encoded_tokens[training_size:training_size + val_size]
+        test_tokens = encoded_tokens[training_size + val_size:]
 
-    optimizer = torch.optim.AdamW(jpt.parameters(), lr=1e-4)
+        print("Training the model")
 
-    num_training_steps = 5000
+        optimizer = torch.optim.AdamW(jpt.parameters(), lr=1e-4)
 
-    for step in range(num_training_steps):
-        if step % int(num_training_steps / 20) == 0:
-            losses = estimate_loss(jpt, training_tokens, val_tokens, batch_size, context_size)
-            print(f"Step [{step}/{num_training_steps}]: train loss {losses['train']} | val loss {losses['val']}")
+        num_training_steps = 10000
 
-        xb, yb = get_batch(training_tokens, batch_size, context_size)
+        for step in range(num_training_steps):
+            if step % int(num_training_steps / 100) == 0:
+                losses = estimate_loss(jpt, training_tokens, val_tokens, batch_size, context_size)
+                print(f"[{time.strftime('%H:%M:%S')}] Step [{step}/{num_training_steps}]: train loss {losses['train']} | val loss {losses['val']}")
 
-        logits, loss = jpt(xb, yb)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+            xb, yb = get_batch(training_tokens, batch_size, context_size)
 
-    losses = estimate_loss(jpt, training_tokens, val_tokens, batch_size, context_size)
-    print(f"Final loss: train loss {losses['train']} | val loss {losses['val']}")
+            logits, loss = jpt(xb, yb)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
 
-    print("Saving the model")
+        losses = estimate_loss(jpt, training_tokens, val_tokens, batch_size, context_size)
+        print(f"Final loss: train loss {losses['train']} | val loss {losses['val']}")
 
-    torch.save(jpt.state_dict(), "./models/jpt1.model")
+        print("Saving the model")
 
-    print("Generating from the model")
+        torch.save(jpt.state_dict(), options.model_path)
 
-    idx = torch.tensor([encode_table['\n']])
-    idx = idx.reshape((1, 1))
-    idx = idx.to(DEVICE)
+    if options.generate:
+        print("Loading model")
 
-    gen = jpt.generate(idx, 1000)
+        print("Generating from the model")
 
-    print("".join([decode_table[t] for t in gen[0].tolist()]))
+        jpt = JulPT(vocab_size, 384, 384, 8)
+        jpt.load_state_dict(torch.load(options.model_path))
+        jpt.to(DEVICE)
+
+        idx = torch.tensor([encode_table['\n']], device=DEVICE)
+        idx = idx.reshape((1, 1))
+        idx = idx.to(DEVICE)
+
+        gen = jpt.generate(idx, options.num_tokens)
+
+        print("".join([decode_table[t] for t in gen[0].tolist()]))

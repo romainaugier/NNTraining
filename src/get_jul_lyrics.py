@@ -88,10 +88,11 @@ def get_lyrics(links_queue: "Queue[str]", buffer: io.StringIO, counter: typing.L
         try:
             lyrics = get_song_lyrics(driver, link)
             lyrics_clean = "\n".join([line for line in lyrics.splitlines()[1:] if line.strip("\n") != ""])
-            lyrics_clean = fix_chars(lyrics_clean)
+            # lyrics_clean = fix_chars(lyrics_clean)
 
             with GET_MUTEX:
                 lyrics_buffer.write(lyrics_clean)
+                lyrics_buffer.write("\n")
                 lyrics_buffer.write("\n")
                 counter[0] += 1
 
