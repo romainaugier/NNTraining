@@ -1,10 +1,17 @@
 import typing
-import sys
 import time
+import math
+import sys
 import optparse
+import json
+import os
+import re
+import tiktoken
+import warnings
+
+warnings.filterwarnings("ignore")
 
 import torch
-from torch._C import _jit_pass_onnx_unpack_quantized_weights
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -12,8 +19,66 @@ import common
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-print(f"Torch device: {DEVICE}")
-# DEVICE = "cpu"
+re_tokenizer = re.compile(r"[A-Z] |\S+'|\d+|[A-Z\.]{2,20}| [a-zà-ÿ]{2,}|[a-zà-ÿ]{2,}|[a-zà-ÿ]{1}|[A-ZÀ-Ñ][a-zà-ÿ]+|[A-ZÀ-Ñ]|(?:\r\n|\r|\n)")
+
+class Tokenizer():
+
+    def __init__(self, path: str = None) -> None:
+        self._table = dict()
+
+        if path is not None and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as file:
+                self._table = json.load(file)
+
+    def train(self, text: str, max_tokens: int = 256) -> None:
+        raise NotImplementedError
+
+    def encode(self, text: str) -> typing.List[int]:
+        raise NotImplementedError
+
+    def decode(self, tokens: typing.List[int]) -> str:
+        raise NotImplementedError
+
+    def save(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(self._table, file)
+
+class BPE(Tokenizer):
+
+    def train(self, text: str, max_tokens: int = 256) -> typing.List[int]:
+        self._table.clear()
+
+        while len(self._table) <= max_tokens:
+            occurences = dict()
+
+            for i in range(len(text) - 1):
+                pair = text[i : i + 1]
+
+                count = occurences.get(pair, 0)
+                occurences[pair] = count + 1
+
+            most_occuring_pair = sorted(list(occurences.items()), key=lambda x: x[1], reverse=True)[0]
+
+            self._table[str(len(self._table) + 1)] = most_occuring_pair
+
+    def encode(self, text: str) -> typing.List[int]:
+        pass
+
+    def decode(self, tokens: typing.List[int]) -> str:
+        pass
+
+def tokenize(text: str) -> typing.Tuple[typing.List[int], typing.Dict[str, int]]:
+    vocab = dict()
+
+    tokens = list()
+
+    for token in re_tokenizer.findall(text):
+        tokens.append(token)
+
+        count = vocab.get(token, 0)
+        vocab[token] = count + 1
+
+    return tokens, vocab
 
 def load_and_prep_data(input_file: str) -> typing.Tuple[typing.List[str], typing.Dict[str, int]]:
     print("Loading data")
@@ -21,11 +86,7 @@ def load_and_prep_data(input_file: str) -> typing.Tuple[typing.List[str], typing
     with open(input_file, "r", encoding="utf-8") as file:
         data = file.read()
 
-    tokens = list(data)
-
-    vocab = { k: 0 for k in sorted(list(set(tokens))) }
-
-    return tokens, vocab
+    return tokenize(data)
 
 def get_vocab_stats(vocab: typing.Dict[str, int], top_tokens_size: int = 50) -> None:
     print(f"Vocab statistics")
@@ -76,9 +137,11 @@ def estimate_loss(model: nn.Module,
 
     out = dict()
 
-    losses = torch.zeros(200)
+    num_estimates = 50
 
-    for k in range(200):
+    losses = torch.zeros(num_estimates)
+
+    for k in range(num_estimates):
         X, Y = get_batch(training_tokens, batch_size, ctx_size)
         _, loss = model(X, Y)
 
@@ -86,7 +149,7 @@ def estimate_loss(model: nn.Module,
 
     out["train"] = losses.mean()
 
-    for k in range(200):
+    for k in range(num_estimates):
         X, Y = get_batch(val_tokens, batch_size, ctx_size)
         _, loss = model(X, Y)
 
@@ -110,7 +173,7 @@ class Head(nn.Module):
         self.register_buffer("tril", torch.tril(torch.ones(context_size, context_size)))
 
     def forward(self, x):
-        B, T, C = x.shape
+        _, T, C = x.shape
 
         k = self.key(x)
         q = self.query(x)
@@ -208,8 +271,11 @@ class JulPT(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens: int):
-        for _ in range(max_new_tokens):
+    def generate(self, idx, max_new_tokens: int, end_token: int = None):
+        idx_next = None
+        i = 0
+
+        while (i < max_new_tokens) or (idx_next != end_token):
             idx_cond = idx[:, -self.context_size:]
 
             logits, loss = self(idx_cond)
@@ -222,31 +288,50 @@ class JulPT(nn.Module):
 
             idx = torch.cat((idx, idx_next), dim=1)
 
-        return idx
+            i += 1
 
-if __name__ == "__main__":
+            yield idx_next
+
+def main() -> None:
     option_parser = optparse.OptionParser()
 
     option_parser.add_option("--train", dest="train", action="store_true")
     option_parser.add_option("--generate", dest="generate", action="store_true")
     option_parser.add_option("--model-path", dest="model_path", type="str", default=None)
     option_parser.add_option("--num-tokens", dest="num_tokens", type="int", default=1000)
+    option_parser.add_option("--num-training-steps", dest="num_training_steps", type="int", default=10000)
+    option_parser.add_option("--tokenizer", dest="tokenizer", type="str", default="r50k_base")
 
     options, args = option_parser.parse_args()
 
-    tokens, vocab = load_and_prep_data(f"{common.DATA_DIR}/lyrics_jul_2.txt")
-    vocab_size = len(vocab)
-
-    encoded_tokens, encode_table, decode_table = encode_tokens(tokens, vocab)
+    encoder = tiktoken.get_encoding(options.tokenizer)
 
     if options.train:
+        if options.model_path is None:
+            print("No path has been specified to load the model")
+            return
+
+        with open(f"{common.DATA_DIR}/lyrics_jul_2.txt", "r", encoding="utf-8") as file:
+            text = file.read()
+
+        encoded_tokens = encoder.encode(text)
+
+        vocab_size = encoder.max_token_value + 1
+
         encoded_tokens = torch.tensor(encoded_tokens)
+        batch_size = 32
 
-        context_size = 384
-        batch_size = 64
+        params = {
+            "n_embeddings": 384,
+            "n_layers": 64,
+            "context_size": 256,
+            "vocab_size": vocab_size
+        }
 
-        jpt = JulPT(vocab_size, context_size, 384, 8)
-        jpt = jpt.to(DEVICE)
+        print(f"Model parameters for training:")
+        print(json.dumps(params, indent=2))
+
+        jpt = JulPT(params["vocab_size"], params["context_size"], params["n_embeddings"], params["n_layers"]).to(DEVICE)
 
         training_size = int(len(encoded_tokens) * 0.8)
         val_size = int(len(encoded_tokens) * 0.1)
@@ -256,43 +341,71 @@ if __name__ == "__main__":
         test_tokens = encoded_tokens[training_size + val_size:]
 
         print("Training the model")
+        print(f"Number of training steps: {options.num_training_steps}")
+        print(f"Expecting initial loss of: {-torch.log(torch.Tensor([[1.0 / float(vocab_size)]])).item()}")
 
         optimizer = torch.optim.AdamW(jpt.parameters(), lr=1e-4)
 
-        num_training_steps = 10000
+        num_training_steps = options.num_training_steps
+
+        num_zfill = math.ceil(math.log10(num_training_steps))
 
         for step in range(num_training_steps):
-            if step % int(num_training_steps / 100) == 0:
-                losses = estimate_loss(jpt, training_tokens, val_tokens, batch_size, context_size)
-                print(f"[{time.strftime('%H:%M:%S')}] Step [{step}/{num_training_steps}]: train loss {losses['train']} | val loss {losses['val']}")
+            if (step % int(num_training_steps / 10) == 0) and (step > 0):
+                losses = estimate_loss(jpt, training_tokens, val_tokens, batch_size, params["context_size"])
+                print(f"\n[{time.strftime('%H:%M:%S')}] Step [{str(step).zfill(num_zfill)}/{num_training_steps}]: train loss {losses['train']} | val loss {losses['val']}")
+            else:
+                print(f"\r[{time.strftime('%H:%M:%S')}] Step [{str(step).zfill(num_zfill)}/{num_training_steps}]", end='')
 
-            xb, yb = get_batch(training_tokens, batch_size, context_size)
+            xb, yb = get_batch(training_tokens, batch_size, params["context_size"])
 
-            logits, loss = jpt(xb, yb)
+            _, loss = jpt(xb, yb)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
-        losses = estimate_loss(jpt, training_tokens, val_tokens, batch_size, context_size)
+        losses = estimate_loss(jpt, training_tokens, val_tokens, batch_size, params["context_size"])
         print(f"Final loss: train loss {losses['train']} | val loss {losses['val']}")
 
         print("Saving the model")
 
         torch.save(jpt.state_dict(), options.model_path)
 
+        model_dir = os.path.dirname(options.model_path)
+        model_name, _ = os.path.splitext(os.path.basename(options.model_path))
+
+        params_file_path = f"{model_dir}/{model_name}_parms.json"
+
+        with open(params_file_path, "w") as file:
+            json.dump(params, file)
+
     if options.generate:
         print("Loading model")
 
+        model_dir = os.path.dirname(options.model_path)
+        model_name, _ = os.path.splitext(os.path.basename(options.model_path))
+        params_file_path = f"{model_dir}/{model_name}_parms.json"
+
+        with open(params_file_path, "r") as file:
+            params = json.load(file)
+
         print("Generating from the model")
 
-        jpt = JulPT(vocab_size, 384, 384, 8)
-        jpt.load_state_dict(torch.load(options.model_path))
+        jpt = JulPT(params["vocab_size"],
+                    params["context_size"],
+                    params["n_embeddings"],
+                    params["n_layers"])
+
+        jpt.load_state_dict(torch.load(options.model_path, map_location=DEVICE))
         jpt.to(DEVICE)
 
-        idx = torch.tensor([encode_table['\n']], device=DEVICE)
+        idx = torch.tensor([encoder.encode('\n')], device=DEVICE)
         idx = idx.reshape((1, 1))
         idx = idx.to(DEVICE)
 
-        gen = jpt.generate(idx, options.num_tokens)
+        for gen in jpt.generate(idx, options.num_tokens, end_token=encoder.encode('\n')[0]):
+            sys.stdout.write(encoder.decode([gen]))
+            sys.stdout.flush()
 
-        print("".join([decode_table[t] for t in gen[0].tolist()]))
+if __name__ == "__main__":
+    main()

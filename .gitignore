@@ -3,3 +3,7 @@ env
 
 # Python files
 *.pyc
+__pycache__
+
+# Models and data
+*.models

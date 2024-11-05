@@ -99,7 +99,7 @@ def get_lyrics(links_queue: "Queue[str]", buffer: io.StringIO, counter: typing.L
         except Exception:
             print("Error")
 
-    close_driver(driver)
+    scrap.close_driver(driver)
 
 if __name__ == "__main__":
     driver = scrap.init_driver()
